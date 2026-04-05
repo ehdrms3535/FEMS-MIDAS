@@ -1,29 +1,56 @@
-# edge/communication/mqtt_client.py
-# Edge MQTT 클라이언트 (paho-mqtt)
-#
-# - EdgeMQTTClient(node_id, factory_ids) 클래스
-#     connect()    : 브로커 연결 (MQTT_HOST 환경변수)
-#     disconnect() : 연결 종료
-#
-# - publish_telemetry(factory_id, payload)
-#     토픽: factory/{node_id}/{factory_id}/telemetry
-#     QoS 1, 오프라인 시 SQLite 로컬 캐시에 저장
-#
-# - subscribe_command()
-#     토픽: factory/{node_id}/+/command
-#     수신 시 on_command() 콜백 호출
-#
-# - on_command(factory_id, payload)
-#     action 분기:
-#       SET_SCHEDULE    → scheduler에 블록 반영
-#       SET_PWM         → pwm_controller.set_duty_cycle()
-#       SET_TARGET_TEMP → 목표 온도 로컬 변수 업데이트
-#       STOP            → PWM 0% + manual_stop 플래그
-#       START           → manual_stop 해제 + 스케줄 재개
-#
-# - send_ack(factory_id, command_id, status)
-#     토픽: factory/{node_id}/{factory_id}/ack
-#
-# - flush_buffered(factory_id)
-#     SQLite 캐시에 쌓인 telemetry를
-#     factory/{node_id}/{factory_id}/buffered 토픽으로 일괄 발행
+import json
+import os
+import paho.mqtt.client as mqtt
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class EdgeMQTTClient:
+    def __init__(self, node_id: str, factory_ids: list):
+        self.node_id = node_id
+        self.factory_ids = factory_ids
+        self.client = mqtt.Client()
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+
+    def connect(self):
+        host = os.getenv("MQTT_HOST", "localhost")
+        port = int(os.getenv("MQTT_PORT", 1883))
+        self.client.connect(host, port)
+        self.client.loop_start()
+        print(f"MQTT 브로커 연결 중: {host}:{port}")
+
+    def disconnect(self):
+        self.client.loop_stop()
+        self.client.disconnect()
+
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            print("브로커 연결 성공")
+            for factory_id in self.factory_ids:
+                topic = f"factory/{self.node_id}/{factory_id}/command"
+                client.subscribe(topic)
+                print(f"구독: {topic}")
+        else:
+            print(f"브로커 연결 실패: {rc}")
+
+    def _on_message(self, client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode())
+            print(f"명령 수신: {msg.topic} → {payload}")
+        except Exception as e:
+            print(f"명령 처리 오류: {e}")
+
+    def publish_telemetry(self, factory_id: int, temperature_c: float, humidity_pct: float):
+        payload = {
+            "factory_id": factory_id,
+            "node_id": self.node_id,
+            "temperature_c": round(temperature_c, 2),
+            "humidity_pct": round(humidity_pct, 2),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        topic = f"factory/{self.node_id}/{factory_id}/telemetry"
+        self.client.publish(topic, json.dumps(payload), qos=1)
+        print(f"발행: {topic} → temp={temperature_c}°C, humidity={humidity_pct}%")

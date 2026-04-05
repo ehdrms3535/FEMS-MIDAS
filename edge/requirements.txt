@@ -1,9 +1,6 @@
-# edge/requirements.txt
-# RPi4에 설치할 패키지
-#
-# paho-mqtt             # MQTT 클라이언트
-# adafruit-circuitpython-dht  # DHT22 센서
-# RPi.GPIO              # GPIO / PWM 제어
-# apscheduler           # 로컬 스케줄 루프
-# python-dotenv
-# sqlalchemy            # SQLite 로컬 캐시 (동기)
+paho-mqtt
+adafruit-circuitpython-dht
+RPi.GPIO
+apscheduler
+python-dotenv
+sqlalchemy

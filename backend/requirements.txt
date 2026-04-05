@@ -1,19 +1,17 @@
-# backend/requirements.txt
-#
-# fastapi
-# uvicorn[standard]
-# pydantic[email]
-# sqlalchemy[asyncio]
-# asyncpg               # PostgreSQL async 드라이버
-# alembic               # DB 마이그레이션
-# paho-mqtt             # MQTT 클라이언트
-# apscheduler           # 백그라운드 스케줄러
-# httpx                 # 기상청 API 호출 (async)
-# pulp                  # 선형 계획법 최적화
-# prophet               # 시계열 예측
-# pandas
-# scikit-learn          # Isolation Forest (예지 보전)
-# python-jose[cryptography]  # JWT 인증
-# python-dotenv
-# pytest
-# pytest-asyncio
+fastapi
+uvicorn[standard]
+pydantic[email]
+sqlalchemy[asyncio]
+asyncpg
+alembic
+paho-mqtt
+apscheduler
+httpx
+pulp
+prophet
+pandas
+scikit-learn
+python-jose[cryptography]
+python-dotenv
+pytest
+pytest-asyncio
