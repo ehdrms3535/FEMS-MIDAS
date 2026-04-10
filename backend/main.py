@@ -19,6 +19,7 @@ from database.connection import engine, create_all_tables
 from mqtt.subscriber import MQTTSubscriber
 from routers.readonly import router as readonly_router
 from routers.control import router as control_router
+from routers.weather import router as weather_router
 
 app = FastAPI()
 mqtt_subscriber: MQTTSubscriber = None
@@ -33,6 +34,7 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 app.include_router(readonly_router)
 app.include_router(control_router)
+app.include_router(weather_router)
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():

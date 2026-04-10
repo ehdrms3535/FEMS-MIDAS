@@ -97,10 +97,10 @@
 
 ### 외부 API 연동
 
-- [ ] **기상청 API**
+- [x] **기상청 API**
   - 외부 온도/날씨 데이터 수집
-  - 스케줄 최적화 시 활용
-  - `.env`에 `KMA_API_KEY` 설정 필요
+  - `GET /api/v1/weather/today`, `GET /api/v1/weather/tomorrow`
+  - `.env`에 `KMA_API_KEY`, `KMA_NX`, `KMA_NY` 설정
 
 - [ ] **한전 전기요금 API**
   - 시간대별 전기요금 조회
@@ -127,7 +127,7 @@
   - 정상: 초록, 임계값 초과: 빨강
   - `edge/controllers/led_controller.py` 구현
 
-- [ ] **부저 알림**
+- [ ] **부저 알림** // 보류
   - GPIO 출력으로 제어
   - 임계값 초과 시 경보음
   - `edge/controllers/buzzer_controller.py` 구현
