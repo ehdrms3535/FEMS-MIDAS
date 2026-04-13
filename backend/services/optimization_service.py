@@ -174,15 +174,23 @@ def _estimated_grid_kwh_from_temp(
     bounded_temp = max(min_precool_temp_c, min(target_temp_c, recommended_temp_c))
     temp_drop = max(0.0, target_temp_c - bounded_temp)
     temp_drop_ratio = temp_drop / span
+    deep_cooling_threshold_ratio = max(
+        0.0,
+        min(1.0, float(env_weights.get("deep_cooling_threshold_ratio", 0.55))),
+    )
+    low_temp_extra_kwh_per_c = max(0.0, float(env_weights.get("low_temp_extra_kwh_per_c", 0.12)))
+    deep_cooling_threshold_c = span * deep_cooling_threshold_ratio
+    deep_cooling_extra_drop_c = max(0.0, temp_drop - deep_cooling_threshold_c)
     base_maintenance_kwh = float(env_weights.get("base_maintenance_kwh_per_slot", 0.35))
     cooling_kwh_per_c = float(env_weights.get("cooling_kwh_per_c", 0.20))
     ambient_kwh_gain_per_c = float(env_weights.get("ambient_kwh_gain_per_c", 0.06))
     inbound_kwh_per_unit = float(env_weights.get("inbound_kwh_per_unit", 0.015))
     stability_kwh_per_ratio = float(env_weights.get("stability_kwh_per_ratio", 0.05))
     cooling_kwh = temp_drop * (cooling_kwh_per_c + (ambient_kwh_gain_per_c * ambient_risk))
+    low_temp_extra_kwh = deep_cooling_extra_drop_c * low_temp_extra_kwh_per_c
     load_kwh = inbound_units * inbound_kwh_per_unit
     stability_kwh = temp_drop_ratio * stability_kwh_per_ratio
-    return max(0.0, base_maintenance_kwh + cooling_kwh + load_kwh + stability_kwh)
+    return max(0.0, base_maintenance_kwh + cooling_kwh + low_temp_extra_kwh + load_kwh + stability_kwh)
 
 
 def _parse_planned_inbound_by_factory(job: dict[str, Any]) -> dict[int, float]:
@@ -381,6 +389,7 @@ def run_optimization(
     temp_dev: dict[int, pulp.LpVariable] = {}
     inbound_shortfall: dict[int, pulp.LpVariable] = {}
     economic_dev: dict[int, pulp.LpVariable] = {}
+    deep_cooling_extra_drop: dict[int, pulp.LpVariable] = {}
     desired_temp_by_factory: dict[int, float] = {}
     economic_target_temp_by_factory: dict[int, float] = {}
     temp_gap_by_factory: dict[int, float] = {}
@@ -414,6 +423,11 @@ def run_optimization(
     )
     economic_precool_max_c = max(0.0, float(env_weights.get("economic_precool_max_c", 1.8)))
     economic_tracking_penalty_weight = float(env_weights.get("economic_tracking_penalty_weight", 35.0))
+    deep_cooling_threshold_ratio = max(
+        0.0,
+        min(1.0, float(env_weights.get("deep_cooling_threshold_ratio", 0.55))),
+    )
+    low_temp_extra_kwh_per_c = max(0.0, float(env_weights.get("low_temp_extra_kwh_per_c", 0.12)))
 
     for factory in sensor_states:
         factory_id = int(factory["factory_id"])
@@ -445,9 +459,22 @@ def run_optimization(
         )
         # 온도 하강량과 입고 열부하를 사용해 슬롯 전력사용량을 추정한다.
         temp_drop_expr = target_temp - recommended_temp[factory_id]
+        deep_cooling_threshold_c = temp_span * deep_cooling_threshold_ratio
+        deep_cooling_extra_drop[factory_id] = pulp.LpVariable(
+            f"deep_cooling_extra_drop_{factory_id}",
+            lowBound=0,
+            upBound=temp_span,
+            cat="Continuous",
+        )
+        # deep_cooling_extra_drop_i >= max(0, temp_drop_i - deep_cooling_threshold_i)
+        problem += (
+            deep_cooling_extra_drop[factory_id] >= temp_drop_expr - deep_cooling_threshold_c,
+            f"deep_cooling_extra_drop_pos_{factory_id}",
+        )
         estimated_grid_kwh_expr = (
             base_maintenance_kwh
             + (temp_drop_expr * cooling_strength_per_c)
+            + (deep_cooling_extra_drop[factory_id] * low_temp_extra_kwh_per_c)
             + (inbound_units_factory * inbound_kwh_per_unit)
             + ((temp_drop_expr / temp_span) * stability_kwh_per_ratio)
         )
@@ -556,6 +583,7 @@ def run_optimization(
     )
     constraint_expressions = [
         "forall i: min_precool_temp_i <= temp_i <= target_temp_i",
+        "forall i: deep_cooling_extra_drop_i >= max(0, (target_temp_i - temp_i) - deep_cooling_threshold_i)",
         "forall i: temp_setpoint_dev_i >= |temp_i - desired_temp_i|",
         "forall i: inbound_temp_shortfall_i >= max(0, temp_i - inbound_required_temp_i)",
         "forall i: economic_temp_dev_i >= |temp_i - economic_target_temp_i|",
@@ -632,6 +660,8 @@ def run_optimization(
                 "inbound_cooling_c_per_unit": round(inbound_cooling_c_per_unit, 4),
                 "shipment_cooling_relief_c_per_unit": round(shipment_cooling_relief_c_per_unit, 4),
                 "door_open_loss_c_per_event": round(door_open_loss_c_per_event, 4),
+                "deep_cooling_threshold_ratio": round(deep_cooling_threshold_ratio, 4),
+                "low_temp_extra_kwh_per_c": round(low_temp_extra_kwh_per_c, 4),
                 "inbound_allocation_source": inbound_allocation_source,
             },
             "inbound_allocation": {
@@ -652,6 +682,7 @@ def run_optimization(
     total_solar_credit_term = 0.0
     total_ambient_penalty_term = 0.0
     total_temp_tracking_penalty_term = 0.0
+    total_low_temp_extra_term = 0.0
     total_inbound_cooling_penalty_term = 0.0
     total_economic_tracking_penalty_term = 0.0
     mode_temp_drop_threshold_c = float(env_weights.get("mode_temp_drop_threshold_c", 1.5))
@@ -669,9 +700,15 @@ def run_optimization(
             env_weights=env_weights,
         )
         temp_drop_val = max(0.0, target_temp_by_factory[factory_id] - recommended_temp_val)
+        deep_threshold_c = (
+            max(0.1, target_temp_by_factory[factory_id] - min_precool_temp_by_factory[factory_id])
+            * deep_cooling_threshold_ratio
+        )
+        deep_extra_drop_val = max(0.0, temp_drop_val - deep_threshold_c)
         variable_values[str(factory_id)] = {
             "recommended_temp_c": round(recommended_temp_val, 4),
             "estimated_grid_kwh": round(estimated_grid_kwh_val, 4),
+            "deep_cooling_extra_drop_c": round(deep_extra_drop_val, 4),
             "inbound_shortfall_c": round(
                 max(0.0, recommended_temp_val - inbound_required_cap_temp_by_factory[factory_id]), 4
             ),
@@ -685,6 +722,7 @@ def run_optimization(
         )
         desired_temp = desired_temp_by_factory.get(factory_id, target_temp_by_factory[factory_id])
         total_temp_tracking_penalty_term += abs(recommended_temp_val - desired_temp) * temp_tracking_penalty_weight
+        total_low_temp_extra_term += deep_extra_drop_val * low_temp_extra_kwh_per_c
         total_inbound_cooling_penalty_term += (
             max(0.0, recommended_temp_val - inbound_required_cap_temp_by_factory[factory_id])
             * inbound_cooling_penalty_weight
@@ -727,6 +765,7 @@ def run_optimization(
             "solar_credit_term": round(total_solar_credit_term, 6),
             "ambient_penalty_term": round(total_ambient_penalty_term, 6),
             "temp_tracking_penalty_term": round(total_temp_tracking_penalty_term, 6),
+            "low_temp_extra_term": round(total_low_temp_extra_term, 6),
             "inbound_cooling_penalty_term": round(total_inbound_cooling_penalty_term, 6),
             "economic_tracking_penalty_term": round(total_economic_tracking_penalty_term, 6),
             "objective_value": round(
@@ -802,6 +841,8 @@ def run_optimization(
             "stability_kwh_per_ratio": round(stability_kwh_per_ratio, 4),
             "daily_shipment_hour": daily_shipment_hour,
             "daily_shipment_max_ratio": round(daily_shipment_max_ratio, 4),
+            "deep_cooling_threshold_ratio": round(deep_cooling_threshold_ratio, 4),
+            "low_temp_extra_kwh_per_c": round(low_temp_extra_kwh_per_c, 4),
             "inbound_allocation_source": inbound_allocation_source,
         },
     }
