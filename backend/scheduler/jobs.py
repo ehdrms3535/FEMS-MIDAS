@@ -291,6 +291,55 @@ def _planned_inbound_by_factory(
     return result
 
 
+def _planned_shipment_by_factory(
+    data: dict[str, Any],
+    job_id: str | None,
+    available_factory_ids: set[int],
+) -> dict[int, float]:
+    """더미의 shipment_allocations에서 공장별 출고 총량 계획을 읽어온다."""
+    if not job_id:
+        return {}
+    result: dict[int, float] = {}
+    for row in data.get("shipment_allocations", []):
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("job_id")) != str(job_id):
+            continue
+        try:
+            factory_id = int(row.get("factory_id"))
+        except (TypeError, ValueError):
+            continue
+        if factory_id not in available_factory_ids:
+            continue
+        planned_units = float(row.get("planned_shipment_units_until_deadline", 0.0) or 0.0)
+        result[factory_id] = max(0.0, planned_units)
+    return result
+
+
+def _door_open_count_by_factory(
+    data: dict[str, Any],
+    now: datetime,
+    horizon_end: datetime,
+    available_factory_ids: set[int],
+) -> dict[int, int]:
+    """현재 슬롯(now~horizon_end)의 공장별 문열림 횟수를 집계한다."""
+    counts = {factory_id: 0 for factory_id in available_factory_ids}
+    for row in data.get("door_open_events", []):
+        if not isinstance(row, dict):
+            continue
+        ts = _parse_iso(row.get("timestamp"))
+        if ts is None or not (now <= ts < horizon_end):
+            continue
+        try:
+            factory_id = int(row.get("factory_id"))
+        except (TypeError, ValueError):
+            continue
+        if factory_id not in counts:
+            continue
+        counts[factory_id] += 1
+    return counts
+
+
 def _heuristic_blocks(ctx: JobAContext) -> list[dict[str, Any]]:
     """PuLP 미구현 시 데모용으로 간단한 휴리스틱 스케줄 블록을 생성한다."""
     blocks: list[dict[str, Any]] = []
@@ -376,15 +425,36 @@ def run_job_a_optimization(
     solar_forecast = _solar_forecast_for_horizon(data, resolved_now, deadline)
     outdoor_temp_forecast = _outdoor_temp_forecast_for_horizon(data, resolved_now, deadline)
 
+    available_factory_ids = {int(factory.get("factory_id")) for factory in factories if "factory_id" in factory}
     planned_inbound_by_factory = _planned_inbound_by_factory(
         data,
         active_job.get("job_id"),
-        {int(factory.get("factory_id")) for factory in factories if "factory_id" in factory},
+        available_factory_ids,
+    )
+    planned_shipment_by_factory = _planned_shipment_by_factory(
+        data,
+        active_job.get("job_id"),
+        available_factory_ids,
+    )
+    slot_end = resolved_now + timedelta(minutes=30)
+    door_open_count_by_factory = _door_open_count_by_factory(
+        data=data,
+        now=resolved_now,
+        horizon_end=slot_end,
+        available_factory_ids=available_factory_ids,
     )
     optimization_job = dict(active_job)
     if planned_inbound_by_factory:
         optimization_job["planned_inbound_by_factory"] = {
             str(factory_id): units for factory_id, units in planned_inbound_by_factory.items()
+        }
+    if planned_shipment_by_factory:
+        optimization_job["planned_shipment_by_factory"] = {
+            str(factory_id): units for factory_id, units in planned_shipment_by_factory.items()
+        }
+    if door_open_count_by_factory:
+        optimization_job["door_open_count_by_factory"] = {
+            str(factory_id): count for factory_id, count in door_open_count_by_factory.items()
         }
 
     ctx = JobAContext(

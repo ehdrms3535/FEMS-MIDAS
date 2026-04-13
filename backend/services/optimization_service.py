@@ -201,6 +201,38 @@ def _parse_planned_inbound_by_factory(job: dict[str, Any]) -> dict[int, float]:
     return parsed
 
 
+def _parse_planned_shipment_by_factory(job: dict[str, Any]) -> dict[int, float]:
+    """job에 포함된 공장별 계획 출고량(마감까지 총량)을 파싱한다."""
+    raw = job.get("planned_shipment_by_factory")
+    if not isinstance(raw, dict):
+        return {}
+    parsed: dict[int, float] = {}
+    for key, value in raw.items():
+        try:
+            factory_id = int(key)
+            units = float(value or 0.0)
+        except (TypeError, ValueError):
+            continue
+        parsed[factory_id] = max(0.0, units)
+    return parsed
+
+
+def _parse_door_open_count_by_factory(job: dict[str, Any]) -> dict[int, int]:
+    """job에 포함된 슬롯별 공장 문열림 횟수를 파싱한다."""
+    raw = job.get("door_open_count_by_factory")
+    if not isinstance(raw, dict):
+        return {}
+    parsed: dict[int, int] = {}
+    for key, value in raw.items():
+        try:
+            factory_id = int(key)
+            count = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        parsed[factory_id] = max(0, count)
+    return parsed
+
+
 def _dynamic_inbound_scores(sensor_states: list[dict[str, Any]]) -> dict[int, float]:
     """공장 상태(여유용량/온도마진/상태)를 점수화해 동적 분배 비율의 기반을 만든다."""
     scores: dict[int, float] = {}
@@ -327,6 +359,21 @@ def run_optimization(
         sensor_states=sensor_states,
         planned_inbound_by_factory=planned_inbound_by_factory,
     )
+    planned_shipment_by_factory = _parse_planned_shipment_by_factory(job)
+    daily_shipment_hour = int(job.get("daily_shipment_hour", 6))
+    daily_shipment_max_ratio = max(0.0, min(1.0, float(job.get("daily_shipment_max_ratio", 0.25))))
+    planned_total_shipment = float(job.get("planned_total_shipment_until_deadline", 0.0) or 0.0)
+    shipment_units_by_factory = {int(factory["factory_id"]): 0.0 for factory in sensor_states}
+    if now.hour == daily_shipment_hour and planned_total_shipment > 0 and planned_shipment_by_factory:
+        slot_shipment_total = min(
+            planned_total_shipment * daily_shipment_max_ratio,
+            sum(planned_shipment_by_factory.values()),
+        )
+        shipment_weight_total = sum(planned_shipment_by_factory.values()) or 1.0
+        for factory_id, total_units in planned_shipment_by_factory.items():
+            ratio = total_units / shipment_weight_total
+            shipment_units_by_factory[factory_id] = max(0.0, slot_shipment_total * ratio)
+    door_open_count_by_factory = _parse_door_open_count_by_factory(job)
     inbound_cooling_c_per_unit = max(0.0, float(env_weights.get("inbound_cooling_c_per_unit", 0.09)))
 
     problem = pulp.LpProblem("midas_job_a_slot_optimization", pulp.LpMinimize)
@@ -354,6 +401,12 @@ def run_optimization(
     solar_util_ratio = max(0.0, min(1.0, solar_kwh / solar_util_reference_kwh))
     ambient_temp_penalty_weight = float(env_weights.get("ambient_temp_penalty_weight", 0.03))
     inbound_cooling_penalty_weight = float(env_weights.get("inbound_cooling_penalty_weight", 45.0))
+    releasable_margin_ref_c = max(0.1, float(env_weights.get("releasable_margin_ref_c", 4.0)))
+    shipment_cooling_relief_c_per_unit = max(
+        0.0,
+        float(env_weights.get("shipment_cooling_relief_c_per_unit", 0.06)),
+    )
+    door_open_loss_c_per_event = max(0.0, float(env_weights.get("door_open_loss_c_per_event", 0.22)))
     economic_signal = _economic_precool_signal(
         tou_price=tou_price,
         solar_kwh=solar_kwh,
@@ -368,7 +421,16 @@ def run_optimization(
         min_precool_temp = float(factory.get("min_precool_temp_c", env_weights.get("min_precool_temp_c", -27.0)))
         temp_span = max(0.1, target_temp - min_precool_temp)
         inbound_units_factory = inbound_units_by_factory.get(factory_id, 0.0)
-        required_extra_cooling_c = min(temp_span, inbound_units_factory * inbound_cooling_c_per_unit)
+        shipment_units_factory = shipment_units_by_factory.get(factory_id, 0.0)
+        current_temp = float(factory.get("temperature_c", target_temp))
+        temp_margin = max(0.0, target_temp - current_temp)
+        releasable_factor = min(1.0, temp_margin / releasable_margin_ref_c)
+        shipment_relief_c = shipment_units_factory * shipment_cooling_relief_c_per_unit * releasable_factor
+        door_open_loss_c = float(door_open_count_by_factory.get(factory_id, 0)) * door_open_loss_c_per_event
+        required_extra_cooling_c = min(
+            temp_span,
+            max(0.0, (inbound_units_factory * inbound_cooling_c_per_unit) - shipment_relief_c + door_open_loss_c),
+        )
         required_extra_cooling_c_by_factory[factory_id] = required_extra_cooling_c
         target_temp_by_factory[factory_id] = target_temp
         min_precool_temp_by_factory[factory_id] = min_precool_temp
@@ -541,8 +603,8 @@ def run_optimization(
                     "start_at": now.isoformat(),
                     "end_at": horizon_end.isoformat(),
                     "mode": mode,
-                    "target_temp_c": target_temp,
-                    "recommended_temp_c": target_temp,
+                "target_temp_c": round(target_temp, 2),
+                "recommended_temp_c": round(target_temp, 2),
                     "expected_grid_kwh": round(max(0.0, estimated_grid_kwh), 3),
                     "expected_solar_kwh": max(0.0, solar_kwh * w_solar),
                     "reason": "LP_FALLBACK",
@@ -568,11 +630,15 @@ def run_optimization(
                 "remaining_time_hours": round(remaining_time_hours, 3),
                 "temp_tracking_penalty_weight": round(temp_tracking_penalty_weight, 4),
                 "inbound_cooling_c_per_unit": round(inbound_cooling_c_per_unit, 4),
+                "shipment_cooling_relief_c_per_unit": round(shipment_cooling_relief_c_per_unit, 4),
+                "door_open_loss_c_per_event": round(door_open_loss_c_per_event, 4),
                 "inbound_allocation_source": inbound_allocation_source,
             },
             "inbound_allocation": {
                 str(fid): {
                     "slot_inbound_units": round(inbound_units_by_factory.get(fid, 0.0), 4),
+                    "slot_shipment_units": round(shipment_units_by_factory.get(fid, 0.0), 4),
+                    "door_open_count": int(door_open_count_by_factory.get(fid, 0)),
                     "required_extra_cooling_c": round(required_extra_cooling_c_by_factory.get(fid, 0.0), 4),
                 }
                 for fid in sorted(inbound_units_by_factory.keys())
@@ -643,8 +709,8 @@ def run_optimization(
                 "start_at": now.isoformat(),
                 "end_at": horizon_end.isoformat(),
                 "mode": mode,
-                "target_temp_c": target_temp_by_factory[factory_id],
-                "recommended_temp_c": round(recommended_temp_val, 1),
+                "target_temp_c": round(target_temp_by_factory[factory_id], 2),
+                "recommended_temp_c": round(recommended_temp_val, 2),
                 "expected_grid_kwh": round(max(0.0, estimated_grid_kwh_val), 3),
                 "expected_solar_kwh": round(max(0.0, solar_kwh * w_solar), 3),
                 "reason": reason,
@@ -702,6 +768,8 @@ def run_optimization(
         "inbound_allocation": {
             str(fid): {
                 "slot_inbound_units": round(inbound_units_by_factory.get(fid, 0.0), 4),
+                "slot_shipment_units": round(shipment_units_by_factory.get(fid, 0.0), 4),
+                "door_open_count": int(door_open_count_by_factory.get(fid, 0)),
                 "required_extra_cooling_c": round(required_extra_cooling_c_by_factory.get(fid, 0.0), 4),
             }
             for fid in sorted(inbound_units_by_factory.keys())
@@ -726,10 +794,14 @@ def run_optimization(
             "economic_signal": round(economic_signal, 4),
             "economic_precool_max_c": round(economic_precool_max_c, 4),
             "inbound_cooling_c_per_unit": round(inbound_cooling_c_per_unit, 4),
+            "shipment_cooling_relief_c_per_unit": round(shipment_cooling_relief_c_per_unit, 4),
+            "door_open_loss_c_per_event": round(door_open_loss_c_per_event, 4),
             "cooling_strength_per_c": round(cooling_strength_per_c, 4),
             "base_maintenance_kwh_per_slot": round(base_maintenance_kwh, 4),
             "inbound_kwh_per_unit": round(inbound_kwh_per_unit, 4),
             "stability_kwh_per_ratio": round(stability_kwh_per_ratio, 4),
+            "daily_shipment_hour": daily_shipment_hour,
+            "daily_shipment_max_ratio": round(daily_shipment_max_ratio, 4),
             "inbound_allocation_source": inbound_allocation_source,
         },
     }
