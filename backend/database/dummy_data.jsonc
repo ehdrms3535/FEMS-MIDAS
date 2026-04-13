@@ -20,6 +20,8 @@
       "humidity_pct": 41.2,
       "pwm_pct": 72,                 // 펠티어 소자 출력 (0~100%)
       "target_temp_c": -18.0,        // 식품 안전 기준 목표 온도
+      "capacity_units": 500,         // 공장 총 보관 용량(실제 모형 기준으로 전 공장 동일)
+      "current_stock_units": 320,    // 현재 재고량
       "communication_status": "OK",  // OK|DELAYED|DISCONNECTED
       "current_schedule_mode": "ON", // ON|OFF|PRECOOL|COASTING|SOLAR_PRIORITY
       "last_seen_at": "2026-04-02T10:29:58+09:00"
@@ -35,6 +37,8 @@
       "humidity_pct": 38.5,
       "pwm_pct": 45,                 // 코스팅이라 출력 낮음
       "target_temp_c": -18.0,
+      "capacity_units": 500,         // 공장 총 보관 용량(실제 모형 기준으로 전 공장 동일)
+      "current_stock_units": 250,    // 현재 재고량
       "communication_status": "OK",
       "current_schedule_mode": "COASTING",
       "last_seen_at": "2026-04-02T10:29:55+09:00"
@@ -50,6 +54,8 @@
       "humidity_pct": 44.1,
       "pwm_pct": 95,                 // 온도 회복 시도 중, 출력 최대치
       "target_temp_c": -18.0,
+      "capacity_units": 500,         // 공장 총 보관 용량(실제 모형 기준으로 전 공장 동일)
+      "current_stock_units": 340,    // 현재 재고량
       "communication_status": "DELAYED", // 통신 지연 (40초)
       "current_schedule_mode": "ON",
       "last_seen_at": "2026-04-02T10:29:20+09:00"
@@ -65,6 +71,8 @@
       "humidity_pct": 52.3,
       "pwm_pct": 0,                  // 정지 상태
       "target_temp_c": -18.0,
+      "capacity_units": 500,         // 공장 총 보관 용량(실제 모형 기준으로 전 공장 동일)
+      "current_stock_units": 140,    // 현재 재고량
       "communication_status": "OK",
       "current_schedule_mode": "OFF",
       "last_seen_at": "2026-04-02T10:28:00+09:00"
@@ -80,6 +88,8 @@
       "remaining_units": 360,              // 잔여 = target - produced
       "progress_rate": 0.70,               // 진행률 70%
       "deadline_at": "2026-04-02T23:00:00+09:00",
+      "planned_total_inbound_until_deadline": 360, // 마감까지 전체 공장으로 입고될 총량(현재는 remaining과 동일)
+      "inbound_distribution_strategy": "DYNAMIC_OPTIMIZED", // 분배 비율은 고정 입력이 아니라 최적화 결과로 계산
       "strategy": "COST_MIN",              // COST_MIN|SAFETY_FIRST|BALANCED
       "solar_enabled": true,
       "cold_storage_enabled": true,
@@ -87,6 +97,35 @@
       "is_active": true,
       "created_by": "admin",
       "created_at": "2026-04-02T08:00:00+09:00"
+    }
+  ],
+
+  // ── 생산/입고 분배 계획 (factory_id 기준 관리) ───────────────────────
+  // factories에는 정적/현재상태만 두고, 생산량(입고 예정)은 별도 섹션으로 분리 관리
+  "production_allocations": [
+    {
+      "job_id": "job_20260402_001",                    // 대상 작업 ID
+      "factory_id": 1,                                 // 분배 대상 공장
+      "planned_inbound_units_until_deadline": 126,     // 마감까지 이 공장으로 입고 예정 총량
+      "source": "OPTIMIZER_RESULT_SNAPSHOT"            // 최적화 결과 스냅샷(고정 입력 아님)
+    },
+    {
+      "job_id": "job_20260402_001",                    // 대상 작업 ID
+      "factory_id": 2,                                 // 분배 대상 공장
+      "planned_inbound_units_until_deadline": 90,      // 마감까지 이 공장으로 입고 예정 총량
+      "source": "OPTIMIZER_RESULT_SNAPSHOT"            // 최적화 결과 스냅샷(고정 입력 아님)
+    },
+    {
+      "job_id": "job_20260402_001",                    // 대상 작업 ID
+      "factory_id": 3,                                 // 분배 대상 공장
+      "planned_inbound_units_until_deadline": 144,     // 마감까지 이 공장으로 입고 예정 총량
+      "source": "OPTIMIZER_RESULT_SNAPSHOT"            // 최적화 결과 스냅샷(고정 입력 아님)
+    },
+    {
+      "job_id": "job_20260402_001",                    // 대상 작업 ID
+      "factory_id": 4,                                 // 분배 대상 공장
+      "planned_inbound_units_until_deadline": 0,       // manual_stop 공장이라 입고 제외
+      "source": "MANUAL_STOP_EXCLUDE"                  // manual_stop 제외 사유
     }
   ],
 
@@ -258,6 +297,35 @@
     "weather_condition": "CLOUDY",            // CLEAR|CLOUDY|RAINY
     "updated_at": "2026-04-02T18:00:00+09:00"
   },
+
+  // ── 시간대별 기온 예보 (2026-04-03, 더미 반영) ───────────────────────
+  // 현재 단계는 기온만 사용. 풍속/습도/강수는 TODO로 보류(회의 후 확정).
+  // 주의: 00시는 2026-04-04 경계 데이터로 별도 관리.
+  "predict_outdoor_temp_hourly": [
+    {"timestamp": "2026-04-03T01:00:00+09:00", "temp_c": 17.0},
+    {"timestamp": "2026-04-03T02:00:00+09:00", "temp_c": 17.0},
+    {"timestamp": "2026-04-03T03:00:00+09:00", "temp_c": 17.0},
+    {"timestamp": "2026-04-03T04:00:00+09:00", "temp_c": 17.0},
+    {"timestamp": "2026-04-03T05:00:00+09:00", "temp_c": 17.0},
+    {"timestamp": "2026-04-03T06:00:00+09:00", "temp_c": 17.0},
+    {"timestamp": "2026-04-03T07:00:00+09:00", "temp_c": 17.0},
+    {"timestamp": "2026-04-03T08:00:00+09:00", "temp_c": 17.0},
+    {"timestamp": "2026-04-03T09:00:00+09:00", "temp_c": 18.0},
+    {"timestamp": "2026-04-03T10:00:00+09:00", "temp_c": 18.0},
+    {"timestamp": "2026-04-03T11:00:00+09:00", "temp_c": 19.0},
+    {"timestamp": "2026-04-03T12:00:00+09:00", "temp_c": 20.0},
+    {"timestamp": "2026-04-03T13:00:00+09:00", "temp_c": 21.0},
+    {"timestamp": "2026-04-03T14:00:00+09:00", "temp_c": 21.0},
+    {"timestamp": "2026-04-03T15:00:00+09:00", "temp_c": 21.0},
+    {"timestamp": "2026-04-03T16:00:00+09:00", "temp_c": 20.0},
+    {"timestamp": "2026-04-03T17:00:00+09:00", "temp_c": 19.0},
+    {"timestamp": "2026-04-03T18:00:00+09:00", "temp_c": 17.0},
+    {"timestamp": "2026-04-03T19:00:00+09:00", "temp_c": 15.0},
+    {"timestamp": "2026-04-03T20:00:00+09:00", "temp_c": 14.0},
+    {"timestamp": "2026-04-03T21:00:00+09:00", "temp_c": 13.0},
+    {"timestamp": "2026-04-03T22:00:00+09:00", "temp_c": 13.0},
+    {"timestamp": "2026-04-03T23:00:00+09:00", "temp_c": 12.0}
+  ],
 
   // ── TOU 요금 구간 ─────────────────────────────────────────────────
   "pricing_tou": {
