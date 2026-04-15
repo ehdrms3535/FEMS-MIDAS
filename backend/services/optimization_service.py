@@ -18,9 +18,6 @@
 #     심야(저렴): 목표 온도를 -25°C ~ -27°C 로 과냉각 (축냉)
 #     주간(비쌈): Coasting 모드 — 냉각 장치 최소화, 축적된 냉기로 유지
 #
-# - calculate_required_factories(remaining_units, remaining_time_hours)
-#     L1 로직: Q 비율에 따라 필요 공장 수(1~4) 반환
-#
 # - estimate_savings(schedule_blocks, baseline_kwh, tou_prices)
 #     최적화 전/후 전력 비용 차액 계산 → 일간/월간 절감액 반환
 
@@ -37,11 +34,9 @@ _LAST_OPTIMIZATION_DEBUG: dict[str, Any] | None = None
 # -----------------------------------------------------------------------------
 # [현재 구현 매핑]
 # - run_optimization(...)
-#   - 1.5단계 모델: 공장별 ON/COASTING(binary+continuous) 최적화
-#   - 목적: 현재 슬롯(30분)의 비용 최소화 + 태양광 가중치 반영
+#   - 공장별 권장 온도(setpoint) 최적화
+#   - 목적: 현재 슬롯(30분)의 비용 최소화 + 태양광/외기/입고 열부하 반영
 #   - 결과: jobs.py가 바로 사용할 ScheduleBlock list 반환
-# - calculate_required_factories(...)
-#   - L1 규칙을 단순화하여 최소 가동 공장 수(1~4) 계산
 # - estimate_savings(...)
 #   - baseline 대비 단순 절감액 추정
 # -----------------------------------------------------------------------------
@@ -125,25 +120,77 @@ def _dynamic_temp_weight(
     return dynamic_w_temp, base_w_temp, temp_c
 
 
-def _desired_pwm_from_temp(factory: dict[str, Any], w_temp: float) -> tuple[float, float]:
-    """현재 온도 오차와 외기 리스크를 기반으로 공장별 목표 PWM을 계산한다."""
+def _economic_precool_signal(
+    tou_price: float,
+    solar_kwh: float,
+    env_weights: dict[str, Any],
+) -> float:
+    """요금/태양광 신호를 결합해 프리쿨 유도 강도(-1~1)를 계산한다."""
+    tou_ref = max(1.0, float(env_weights.get("tou_reference_price", 180.0)))
+    solar_ref = max(0.1, float(env_weights.get("solar_reference_kwh", 4.0)))
+    tou_gain = max(0.0, float(env_weights.get("tou_precool_gain", 1.0)))
+    solar_gain = max(0.0, float(env_weights.get("solar_precool_gain", 0.9)))
+    tou_score = (tou_ref - tou_price) / tou_ref
+    solar_score = max(0.0, solar_kwh / solar_ref)
+    signal = (tou_score * tou_gain) + (solar_score * solar_gain)
+    return max(-1.0, min(1.0, signal))
+
+
+def _desired_temp_from_state(
+    factory: dict[str, Any],
+    w_temp: float,
+    default_min_precool_temp_c: float,
+) -> tuple[float, float]:
+    """현재 온도 오차와 외기 리스크를 기반으로 공장별 목표 온도를 계산한다."""
     target_temp = float(factory.get("target_temp_c", -18.0))
     current_temp = float(factory.get("temperature_c", target_temp))
     status = str(factory.get("status", ""))
+    min_precool_temp_c = float(factory.get("min_precool_temp_c", default_min_precool_temp_c))
 
     # temp_gap > 0 이면 목표온도보다 따뜻한 상태(냉각 강화 필요)
     temp_gap = current_temp - target_temp
     positive_gap = max(0.0, temp_gap)
     ambient_risk = max(0.0, w_temp - 1.0)
 
-    base_pwm = 20.0
-    temp_gap_pwm_gain = float(factory.get("temp_gap_pwm_gain", 12.0))
-    ambient_pwm_gain = float(factory.get("ambient_pwm_gain", 10.0))
-    desired = base_pwm + (positive_gap * temp_gap_pwm_gain) + (ambient_risk * ambient_pwm_gain)
+    temp_recovery_gain = float(factory.get("temp_recovery_gain_c", 1.0))
+    ambient_precool_gain = float(factory.get("ambient_precool_gain_c", 1.8))
+    desired = target_temp - (positive_gap * temp_recovery_gain) - (ambient_risk * ambient_precool_gain)
     if status == "WARNING":
-        desired = max(desired, 70.0)
-    desired = max(20.0, min(100.0, desired))
+        desired = min(desired, target_temp - 4.0)
+    desired = max(min_precool_temp_c, min(target_temp, desired))
     return desired, temp_gap
+
+
+def _estimated_grid_kwh_from_temp(
+    target_temp_c: float,
+    recommended_temp_c: float,
+    min_precool_temp_c: float,
+    ambient_risk: float,
+    inbound_units: float,
+    env_weights: dict[str, Any],
+) -> float:
+    """온도 setpoint를 슬롯 예상 grid kWh로 환산한다."""
+    span = max(0.1, target_temp_c - min_precool_temp_c)
+    bounded_temp = max(min_precool_temp_c, min(target_temp_c, recommended_temp_c))
+    temp_drop = max(0.0, target_temp_c - bounded_temp)
+    temp_drop_ratio = temp_drop / span
+    deep_cooling_threshold_ratio = max(
+        0.0,
+        min(1.0, float(env_weights.get("deep_cooling_threshold_ratio", 0.55))),
+    )
+    low_temp_extra_kwh_per_c = max(0.0, float(env_weights.get("low_temp_extra_kwh_per_c", 0.12)))
+    deep_cooling_threshold_c = span * deep_cooling_threshold_ratio
+    deep_cooling_extra_drop_c = max(0.0, temp_drop - deep_cooling_threshold_c)
+    base_maintenance_kwh = float(env_weights.get("base_maintenance_kwh_per_slot", 0.35))
+    cooling_kwh_per_c = float(env_weights.get("cooling_kwh_per_c", 0.20))
+    ambient_kwh_gain_per_c = float(env_weights.get("ambient_kwh_gain_per_c", 0.06))
+    inbound_kwh_per_unit = float(env_weights.get("inbound_kwh_per_unit", 0.015))
+    stability_kwh_per_ratio = float(env_weights.get("stability_kwh_per_ratio", 0.05))
+    cooling_kwh = temp_drop * (cooling_kwh_per_c + (ambient_kwh_gain_per_c * ambient_risk))
+    low_temp_extra_kwh = deep_cooling_extra_drop_c * low_temp_extra_kwh_per_c
+    load_kwh = inbound_units * inbound_kwh_per_unit
+    stability_kwh = temp_drop_ratio * stability_kwh_per_ratio
+    return max(0.0, base_maintenance_kwh + cooling_kwh + low_temp_extra_kwh + load_kwh + stability_kwh)
 
 
 def _parse_planned_inbound_by_factory(job: dict[str, Any]) -> dict[int, float]:
@@ -159,6 +206,38 @@ def _parse_planned_inbound_by_factory(job: dict[str, Any]) -> dict[int, float]:
         except (TypeError, ValueError):
             continue
         parsed[factory_id] = max(0.0, units)
+    return parsed
+
+
+def _parse_planned_shipment_by_factory(job: dict[str, Any]) -> dict[int, float]:
+    """job에 포함된 공장별 계획 출고량(마감까지 총량)을 파싱한다."""
+    raw = job.get("planned_shipment_by_factory")
+    if not isinstance(raw, dict):
+        return {}
+    parsed: dict[int, float] = {}
+    for key, value in raw.items():
+        try:
+            factory_id = int(key)
+            units = float(value or 0.0)
+        except (TypeError, ValueError):
+            continue
+        parsed[factory_id] = max(0.0, units)
+    return parsed
+
+
+def _parse_door_open_count_by_factory(job: dict[str, Any]) -> dict[int, int]:
+    """job에 포함된 슬롯별 공장 문열림 횟수를 파싱한다."""
+    raw = job.get("door_open_count_by_factory")
+    if not isinstance(raw, dict):
+        return {}
+    parsed: dict[int, int] = {}
+    for key, value in raw.items():
+        try:
+            factory_id = int(key)
+            count = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        parsed[factory_id] = max(0, count)
     return parsed
 
 
@@ -229,28 +308,6 @@ def _allocate_inbound_units_by_factory(
     return allocations, source
 
 
-def calculate_required_factories(
-    remaining_units: float,
-    remaining_time_hours: float,
-    available_factories: int,
-) -> int:
-    """남은 입고량/시간 기준으로 최소 필요 공장 수를 계산한다."""
-    if remaining_units <= 0:
-        return 1
-    safe_hours = max(0.5, remaining_time_hours)
-    required_rate = remaining_units / safe_hours
-    # 1단계 가정: 공장 1개가 시간당 약 40 unit의 입고 열부하를 안정적으로 처리 가능
-    per_factory_capacity_per_hour = 40.0
-    required = int((required_rate / per_factory_capacity_per_hour) + 0.9999)
-    if required_rate >= 120:
-        required = max(required, 4)
-    elif required_rate >= 60:
-        required = max(required, 2)
-    else:
-        required = max(required, 1)
-    return max(1, min(available_factories, required))
-
-
 def run_optimization(
     job: dict[str, Any],
     sensor_states: list[dict[str, Any]],
@@ -260,7 +317,7 @@ def run_optimization(
     outdoor_temp_forecast: list[dict[str, Any]] | None,
     now: datetime,
 ) -> list[dict[str, Any]]:
-    """현재 슬롯(30분) 기준 ON/COASTING + PWM 최적화 결과 블록을 만든다."""
+    """현재 슬롯(30분) 기준 권장 온도(setpoint) 최적화 결과 블록을 만든다."""
     global _LAST_OPTIMIZATION_DEBUG
     if not sensor_states:
         _LAST_OPTIMIZATION_DEBUG = {
@@ -303,11 +360,6 @@ def run_optimization(
     # 냉각은 단일 30분 슬롯에서 완결되지 않으므로, deadline 압박을 완화한 계획 지평을 사용한다.
     thermal_planning_hours = float(job.get("thermal_planning_hours", 24.0))
     effective_planning_hours = max(6.0, thermal_planning_hours, remaining_time_hours)
-    min_active = calculate_required_factories(
-        remaining_units=remaining_units,
-        remaining_time_hours=effective_planning_hours,
-        available_factories=len(sensor_states),
-    )
     planned_inbound_by_factory = _parse_planned_inbound_by_factory(job)
     inbound_units_this_slot = remaining_units * (slot_hours / effective_planning_hours)
     inbound_units_by_factory, inbound_allocation_source = _allocate_inbound_units_by_factory(
@@ -315,113 +367,243 @@ def run_optimization(
         sensor_states=sensor_states,
         planned_inbound_by_factory=planned_inbound_by_factory,
     )
-    inbound_pwm_per_unit = float(env_weights.get("inbound_pwm_per_unit", 0.8))
-    required_extra_pwm_by_factory = {
-        factory_id: min(80.0, units * inbound_pwm_per_unit)
-        for factory_id, units in inbound_units_by_factory.items()
-    }
-    required_pwm_total = min(
-        100.0 * len(sensor_states),
-        sum((20.0 + required_extra_pwm_by_factory.get(int(factory["factory_id"]), 0.0)) for factory in sensor_states),
-    )
+    planned_shipment_by_factory = _parse_planned_shipment_by_factory(job)
+    daily_shipment_hour = int(job.get("daily_shipment_hour", 6))
+    daily_shipment_max_ratio = max(0.0, min(1.0, float(job.get("daily_shipment_max_ratio", 0.25))))
+    planned_total_shipment = float(job.get("planned_total_shipment_until_deadline", 0.0) or 0.0)
+    shipment_units_by_factory = {int(factory["factory_id"]): 0.0 for factory in sensor_states}
+    if now.hour == daily_shipment_hour and planned_total_shipment > 0 and planned_shipment_by_factory:
+        slot_shipment_total = min(
+            planned_total_shipment * daily_shipment_max_ratio,
+            sum(planned_shipment_by_factory.values()),
+        )
+        shipment_weight_total = sum(planned_shipment_by_factory.values()) or 1.0
+        for factory_id, total_units in planned_shipment_by_factory.items():
+            ratio = total_units / shipment_weight_total
+            shipment_units_by_factory[factory_id] = max(0.0, slot_shipment_total * ratio)
+    door_open_count_by_factory = _parse_door_open_count_by_factory(job)
+    inbound_cooling_c_per_unit = max(0.0, float(env_weights.get("inbound_cooling_c_per_unit", 0.09)))
 
     problem = pulp.LpProblem("midas_job_a_slot_optimization", pulp.LpMinimize)
-    on: dict[int, pulp.LpVariable] = {}
-    pwm: dict[int, pulp.LpVariable] = {}
-    pwm_dev: dict[int, pulp.LpVariable] = {}
-    desired_pwm_by_factory: dict[int, float] = {}
+    recommended_temp: dict[int, pulp.LpVariable] = {}
+    temp_dev: dict[int, pulp.LpVariable] = {}
+    inbound_shortfall: dict[int, pulp.LpVariable] = {}
+    economic_dev: dict[int, pulp.LpVariable] = {}
+    deep_cooling_extra_drop: dict[int, pulp.LpVariable] = {}
+    desired_temp_by_factory: dict[int, float] = {}
+    economic_target_temp_by_factory: dict[int, float] = {}
     temp_gap_by_factory: dict[int, float] = {}
+    target_temp_by_factory: dict[int, float] = {}
+    min_precool_temp_by_factory: dict[int, float] = {}
+    inbound_required_cap_temp_by_factory: dict[int, float] = {}
+    estimated_grid_kwh_expr_by_factory: dict[int, Any] = {}
+    required_extra_cooling_c_by_factory: dict[int, float] = {}
+    ambient_risk = max(0.0, w_temp - 1.0)
+    warning_recovery_c = max(0.0, float(env_weights.get("warning_recovery_c", 4.0)))
+    cooling_strength_per_c = float(env_weights.get("cooling_kwh_per_c", 0.20)) + (
+        float(env_weights.get("ambient_kwh_gain_per_c", 0.06)) * ambient_risk
+    )
+    base_maintenance_kwh = float(env_weights.get("base_maintenance_kwh_per_slot", 0.35))
+    inbound_kwh_per_unit = float(env_weights.get("inbound_kwh_per_unit", 0.015))
+    stability_kwh_per_ratio = float(env_weights.get("stability_kwh_per_ratio", 0.05))
+    solar_util_reference_kwh = max(0.1, float(env_weights.get("solar_util_reference_kwh", 4.0)))
+    solar_util_ratio = max(0.0, min(1.0, solar_kwh / solar_util_reference_kwh))
+    ambient_temp_penalty_weight = float(env_weights.get("ambient_temp_penalty_weight", 0.03))
+    inbound_cooling_penalty_weight = float(env_weights.get("inbound_cooling_penalty_weight", 45.0))
+    releasable_margin_ref_c = max(0.1, float(env_weights.get("releasable_margin_ref_c", 4.0)))
+    shipment_cooling_relief_c_per_unit = max(
+        0.0,
+        float(env_weights.get("shipment_cooling_relief_c_per_unit", 0.06)),
+    )
+    door_open_loss_c_per_event = max(0.0, float(env_weights.get("door_open_loss_c_per_event", 0.22)))
+    economic_signal = _economic_precool_signal(
+        tou_price=tou_price,
+        solar_kwh=solar_kwh,
+        env_weights=env_weights,
+    )
+    economic_precool_max_c = max(0.0, float(env_weights.get("economic_precool_max_c", 1.8)))
+    economic_tracking_penalty_weight = float(env_weights.get("economic_tracking_penalty_weight", 35.0))
+    deep_cooling_threshold_ratio = max(
+        0.0,
+        min(1.0, float(env_weights.get("deep_cooling_threshold_ratio", 0.55))),
+    )
+    low_temp_extra_kwh_per_c = max(0.0, float(env_weights.get("low_temp_extra_kwh_per_c", 0.12)))
 
     for factory in sensor_states:
         factory_id = int(factory["factory_id"])
-        on[factory_id] = pulp.LpVariable(f"on_{factory_id}", lowBound=0, upBound=1, cat="Binary")
-        pwm[factory_id] = pulp.LpVariable(f"pwm_{factory_id}", lowBound=0, upBound=100, cat="Continuous")
-        # 동적 스케줄링에서는 자동 OFF를 허용하지 않고 ON/COASTING만 운용한다.
-        problem += on[factory_id] == 1, f"dynamic_force_on_{factory_id}"
-        problem += pwm[factory_id] <= 100 * on[factory_id], f"pwm_on_link_{factory_id}"
-        # on=1인데 pwm=0이 되는 해를 방지하여 가동 의미를 보장한다.
-        problem += pwm[factory_id] >= 20 * on[factory_id], f"min_pwm_when_on_{factory_id}"
-        required_extra_pwm = required_extra_pwm_by_factory.get(factory_id, 0.0)
-        if required_extra_pwm > 0:
-            # 입고량을 냉각 필요량으로 변환해 공장별 PWM 하한에 반영한다.
-            problem += (
-                pwm[factory_id] >= (20.0 + required_extra_pwm) * on[factory_id],
-                f"inbound_cooling_min_pwm_{factory_id}",
-            )
+        target_temp = float(factory.get("target_temp_c", -18.0))
+        min_precool_temp = float(factory.get("min_precool_temp_c", env_weights.get("min_precool_temp_c", -27.0)))
+        temp_span = max(0.1, target_temp - min_precool_temp)
+        inbound_units_factory = inbound_units_by_factory.get(factory_id, 0.0)
+        shipment_units_factory = shipment_units_by_factory.get(factory_id, 0.0)
+        current_temp = float(factory.get("temperature_c", target_temp))
+        temp_margin = max(0.0, target_temp - current_temp)
+        releasable_factor = min(1.0, temp_margin / releasable_margin_ref_c)
+        shipment_relief_c = shipment_units_factory * shipment_cooling_relief_c_per_unit * releasable_factor
+        door_open_loss_c = float(door_open_count_by_factory.get(factory_id, 0)) * door_open_loss_c_per_event
+        required_extra_cooling_c = min(
+            temp_span,
+            max(0.0, (inbound_units_factory * inbound_cooling_c_per_unit) - shipment_relief_c + door_open_loss_c),
+        )
+        required_extra_cooling_c_by_factory[factory_id] = required_extra_cooling_c
+        target_temp_by_factory[factory_id] = target_temp
+        min_precool_temp_by_factory[factory_id] = min_precool_temp
+        inbound_required_cap_temp = target_temp - required_extra_cooling_c
+        inbound_required_cap_temp_by_factory[factory_id] = inbound_required_cap_temp
 
-        status = str(factory.get("status", ""))
-        # WARNING 공장은 회복 우선: 강제 ON + 최소 PWM
-        if status == "WARNING":
-            problem += on[factory_id] == 1, f"warning_force_on_{factory_id}"
-            problem += pwm[factory_id] >= 70, f"warning_min_pwm_{factory_id}"
-
-        # 연속 패널티용 목표 PWM(온도 오차 + 외기 리스크 반영)
-        desired_pwm, temp_gap = _desired_pwm_from_temp(factory, w_temp)
-        desired_pwm_by_factory[factory_id] = desired_pwm
-        temp_gap_by_factory[factory_id] = temp_gap
-        pwm_dev[factory_id] = pulp.LpVariable(
-            f"pwm_temp_dev_{factory_id}",
-            lowBound=0,
-            upBound=100,
+        recommended_temp[factory_id] = pulp.LpVariable(
+            f"recommended_temp_{factory_id}",
+            lowBound=min_precool_temp,
+            upBound=target_temp,
             cat="Continuous",
         )
-        # pwm_dev >= |pwm - desired_pwm| (L1 절댓값 선형화)
-        problem += pwm_dev[factory_id] >= pwm[factory_id] - desired_pwm, f"pwm_dev_pos_{factory_id}"
-        problem += pwm_dev[factory_id] >= desired_pwm - pwm[factory_id], f"pwm_dev_neg_{factory_id}"
+        # 온도 하강량과 입고 열부하를 사용해 슬롯 전력사용량을 추정한다.
+        temp_drop_expr = target_temp - recommended_temp[factory_id]
+        deep_cooling_threshold_c = temp_span * deep_cooling_threshold_ratio
+        deep_cooling_extra_drop[factory_id] = pulp.LpVariable(
+            f"deep_cooling_extra_drop_{factory_id}",
+            lowBound=0,
+            upBound=temp_span,
+            cat="Continuous",
+        )
+        # deep_cooling_extra_drop_i >= max(0, temp_drop_i - deep_cooling_threshold_i)
+        problem += (
+            deep_cooling_extra_drop[factory_id] >= temp_drop_expr - deep_cooling_threshold_c,
+            f"deep_cooling_extra_drop_pos_{factory_id}",
+        )
+        estimated_grid_kwh_expr = (
+            base_maintenance_kwh
+            + (temp_drop_expr * cooling_strength_per_c)
+            + (deep_cooling_extra_drop[factory_id] * low_temp_extra_kwh_per_c)
+            + (inbound_units_factory * inbound_kwh_per_unit)
+            + ((temp_drop_expr / temp_span) * stability_kwh_per_ratio)
+        )
+        estimated_grid_kwh_expr_by_factory[factory_id] = estimated_grid_kwh_expr
 
-    # L1 기반 최소 가동 공장 수
-    problem += pulp.lpSum(on.values()) >= min_active, "min_active_factories"
-    # 공장별 입고량 기반 PWM 하한을 합산한 전체 안전 하한
-    problem += pulp.lpSum(pwm.values()) >= required_pwm_total, "inbound_heat_buffer_pwm"
+        # 입고 냉각 요구는 hard cap이 아닌 soft penalty로 반영해 요금/태양광 민감도를 확보한다.
+        inbound_shortfall[factory_id] = pulp.LpVariable(
+            f"inbound_temp_shortfall_{factory_id}",
+            lowBound=0,
+            upBound=20,
+            cat="Continuous",
+        )
+        problem += (
+            inbound_shortfall[factory_id] >= recommended_temp[factory_id] - inbound_required_cap_temp,
+            f"inbound_shortfall_pos_{factory_id}",
+        )
 
-    # 비용 최소화 + 태양광 기여 반영 + 폭염 시 냉각 부족 페널티
-    # (0.5h 슬롯 기준: kWh ~= PWM% * 0.02로 단순화)
-    slot_kwh_per_pwm = 0.02
-    cost_term = pulp.lpSum(pwm[fid] * slot_kwh_per_pwm * tou_price for fid in pwm)
-    solar_credit_term = pulp.lpSum(
-        pwm[fid] * slot_kwh_per_pwm * (solar_kwh * w_solar * 0.1) for fid in pwm
+        status = str(factory.get("status", ""))
+        if status == "WARNING":
+            # WARNING 공장은 회복 우선: 권장 온도를 더 낮게 강제
+            warning_cap = max(min_precool_temp, target_temp - warning_recovery_c)
+            problem += recommended_temp[factory_id] <= warning_cap, f"warning_temp_cap_{factory_id}"
+
+        # 온도 오차 추종 연속 패널티용 목표온도
+        desired_temp, temp_gap = _desired_temp_from_state(
+            factory,
+            w_temp,
+            default_min_precool_temp_c=min_precool_temp,
+        )
+        desired_temp_by_factory[factory_id] = desired_temp
+        economic_target_temp = max(
+            min_precool_temp,
+            min(target_temp, target_temp - (economic_signal * economic_precool_max_c)),
+        )
+        economic_target_temp_by_factory[factory_id] = economic_target_temp
+        temp_gap_by_factory[factory_id] = temp_gap
+        temp_dev[factory_id] = pulp.LpVariable(
+            f"temp_setpoint_dev_{factory_id}",
+            lowBound=0,
+            upBound=20,
+            cat="Continuous",
+        )
+        # temp_dev >= |recommended_temp - desired_temp| (L1 절댓값 선형화)
+        problem += (
+            temp_dev[factory_id] >= recommended_temp[factory_id] - desired_temp,
+            f"temp_dev_pos_{factory_id}",
+        )
+        problem += (
+            temp_dev[factory_id] >= desired_temp - recommended_temp[factory_id],
+            f"temp_dev_neg_{factory_id}",
+        )
+        economic_dev[factory_id] = pulp.LpVariable(
+            f"economic_temp_dev_{factory_id}",
+            lowBound=0,
+            upBound=20,
+            cat="Continuous",
+        )
+        problem += (
+            economic_dev[factory_id] >= recommended_temp[factory_id] - economic_target_temp,
+            f"economic_dev_pos_{factory_id}",
+        )
+        problem += (
+            economic_dev[factory_id] >= economic_target_temp - recommended_temp[factory_id],
+            f"economic_dev_neg_{factory_id}",
+        )
+
+    # 비용 최소화 + 태양광 기여 반영 + 고온 리스크 시 충분 냉각 유도
+    cost_term = pulp.lpSum(
+        estimated_grid_kwh_expr_by_factory[fid] * tou_price
+        for fid in estimated_grid_kwh_expr_by_factory
     )
-    thermal_penalty_term = pulp.lpSum((100 - pwm[fid]) * max(0.0, w_temp - 1.0) * 0.02 for fid in pwm)
-    inbound_penalty_weight = max(0.0, inbound_units_this_slot) * 0.03
-    inbound_penalty_term = pulp.lpSum((100 - pwm[fid]) * inbound_penalty_weight * 0.01 for fid in pwm)
+    solar_credit_term = pulp.lpSum(
+        estimated_grid_kwh_expr_by_factory[fid] * tou_price * (solar_util_ratio * w_solar)
+        for fid in estimated_grid_kwh_expr_by_factory
+    )
+    ambient_penalty_term = pulp.lpSum(
+        (recommended_temp[fid] - min_precool_temp_by_factory[fid]) * ambient_risk * ambient_temp_penalty_weight
+        for fid in recommended_temp
+    )
     temp_tracking_penalty_weight = float(env_weights.get("temp_tracking_penalty_weight", 1.2))
     temp_tracking_penalty_term = pulp.lpSum(
-        pwm_dev[fid] * temp_tracking_penalty_weight for fid in pwm_dev
+        temp_dev[fid] * temp_tracking_penalty_weight for fid in temp_dev
+    )
+    inbound_cooling_penalty_term = pulp.lpSum(
+        inbound_shortfall[fid] * inbound_cooling_penalty_weight for fid in inbound_shortfall
+    )
+    economic_tracking_penalty_term = pulp.lpSum(
+        economic_dev[fid] * economic_tracking_penalty_weight for fid in economic_dev
     )
     problem += (
         cost_term
         - solar_credit_term
-        + thermal_penalty_term
-        + inbound_penalty_term
+        + ambient_penalty_term
         + temp_tracking_penalty_term
+        + inbound_cooling_penalty_term
+        + economic_tracking_penalty_term
     )
 
     objective_expression = (
-        "Minimize [sum(pwm_i * 0.02 * tou_price)] "
-        "- [sum(pwm_i * 0.02 * (solar_kwh * w_solar * 0.1))] "
-        "+ [sum((100 - pwm_i) * max(0, w_temp-1.0) * 0.02)] "
-        "+ [sum((100 - pwm_i) * inbound_penalty_weight * 0.01)] "
-        "+ [sum(abs(pwm_i - desired_pwm_i) * temp_tracking_penalty_weight)]"
+        "Minimize [sum(estimated_grid_kwh(temp_i) * tou_price)] "
+        "- [sum(estimated_grid_kwh(temp_i) * tou_price * (solar_util_ratio * w_solar))] "
+        "+ [sum((temp_i - min_precool_i) * ambient_risk * ambient_temp_penalty_weight)] "
+        "+ [sum(abs(temp_i - desired_temp_i) * temp_tracking_penalty_weight)] "
+        "+ [sum(max(0, temp_i - inbound_required_temp_i) * inbound_cooling_penalty_weight)] "
+        "+ [sum(abs(temp_i - economic_target_temp_i) * economic_tracking_penalty_weight)]"
     )
     constraint_expressions = [
-        "forall i: on_i = 1 (dynamic scheduling does not auto-OFF)",
-        "forall i: pwm_i <= 100 * on_i",
-        "forall i: pwm_i >= 20 * on_i",
-        f"sum(on_i) >= {min_active}",
-        f"sum(pwm_i) >= {required_pwm_total:.3f}",
-        "forall i: pwm_temp_dev_i >= |pwm_i - desired_pwm_i|",
+        "forall i: min_precool_temp_i <= temp_i <= target_temp_i",
+        "forall i: deep_cooling_extra_drop_i >= max(0, (target_temp_i - temp_i) - deep_cooling_threshold_i)",
+        "forall i: temp_setpoint_dev_i >= |temp_i - desired_temp_i|",
+        "forall i: inbound_temp_shortfall_i >= max(0, temp_i - inbound_required_temp_i)",
+        "forall i: economic_temp_dev_i >= |temp_i - economic_target_temp_i|",
     ]
     for factory in sensor_states:
         factory_id = int(factory["factory_id"])
-        required_extra_pwm = required_extra_pwm_by_factory.get(factory_id, 0.0)
-        if required_extra_pwm > 0:
+        required_extra_cooling_c = required_extra_cooling_c_by_factory.get(factory_id, 0.0)
+        if required_extra_cooling_c > 0:
             constraint_expressions.append(
-                f"factory {factory_id}: pwm_i >= {(20.0 + required_extra_pwm):.3f} * on_i (inbound cooling)"
+                f"factory {factory_id}: inbound_required_temp_i <= "
+                f"{inbound_required_cap_temp_by_factory[factory_id]:.3f} (soft target)"
             )
     for factory in sensor_states:
         if str(factory.get("status", "")) == "WARNING":
             factory_id = int(factory["factory_id"])
-            constraint_expressions.append(f"factory {factory_id}: on_i = 1, pwm_i >= 70")
+            warning_cap = max(
+                min_precool_temp_by_factory[factory_id],
+                target_temp_by_factory[factory_id] - warning_recovery_c,
+            )
+            constraint_expressions.append(f"factory {factory_id}: temp_i <= {warning_cap:.3f} (warning recovery)")
 
     solver = pulp.PULP_CBC_CMD(msg=False)
     status_code = problem.solve(solver)
@@ -430,15 +612,28 @@ def run_optimization(
         # 해가 불능/비최적일 경우 보수적으로 기존 ON 성향을 유지
         blocks: list[dict[str, Any]] = []
         for factory in sensor_states:
-            mode = "ON" if str(factory.get("status", "")) == "WARNING" else "COASTING"
+            status = str(factory.get("status", ""))
+            mode = "RECOVERY" if status == "WARNING" else "HOLD"
+            target_temp = float(factory.get("target_temp_c", -18.0))
+            min_precool_temp = float(factory.get("min_precool_temp_c", env_weights.get("min_precool_temp_c", -27.0)))
+            factory_id = int(factory["factory_id"])
+            estimated_grid_kwh = _estimated_grid_kwh_from_temp(
+                target_temp_c=target_temp,
+                recommended_temp_c=target_temp,
+                min_precool_temp_c=min_precool_temp,
+                ambient_risk=ambient_risk,
+                inbound_units=inbound_units_by_factory.get(factory_id, 0.0),
+                env_weights=env_weights,
+            )
             blocks.append(
                 {
                     "factory_id": factory["factory_id"],
                     "start_at": now.isoformat(),
                     "end_at": horizon_end.isoformat(),
                     "mode": mode,
-                    "target_temp_c": float(factory.get("target_temp_c", -18.0)),
-                    "expected_grid_kwh": 3.0 if mode == "ON" else 1.0,
+                "target_temp_c": round(target_temp, 2),
+                "recommended_temp_c": round(target_temp, 2),
+                    "expected_grid_kwh": round(max(0.0, estimated_grid_kwh), 3),
                     "expected_solar_kwh": max(0.0, solar_kwh * w_solar),
                     "reason": "LP_FALLBACK",
                 }
@@ -456,19 +651,25 @@ def run_optimization(
                 "outdoor_temp_c": outdoor_temp_c,
                 "outdoor_temp_rows": len(forecast_rows),
                 "solar_kwh": solar_kwh,
-                "slot_kwh_per_pwm": slot_kwh_per_pwm,
-                "min_active": min_active,
+                "solar_util_ratio": round(solar_util_ratio, 4),
+                "solar_util_reference_kwh": round(solar_util_reference_kwh, 4),
                 "thermal_planning_hours": round(thermal_planning_hours, 3),
                 "effective_planning_hours": round(effective_planning_hours, 3),
                 "remaining_time_hours": round(remaining_time_hours, 3),
                 "temp_tracking_penalty_weight": round(temp_tracking_penalty_weight, 4),
-                "inbound_pwm_per_unit": round(inbound_pwm_per_unit, 4),
+                "inbound_cooling_c_per_unit": round(inbound_cooling_c_per_unit, 4),
+                "shipment_cooling_relief_c_per_unit": round(shipment_cooling_relief_c_per_unit, 4),
+                "door_open_loss_c_per_event": round(door_open_loss_c_per_event, 4),
+                "deep_cooling_threshold_ratio": round(deep_cooling_threshold_ratio, 4),
+                "low_temp_extra_kwh_per_c": round(low_temp_extra_kwh_per_c, 4),
                 "inbound_allocation_source": inbound_allocation_source,
             },
             "inbound_allocation": {
                 str(fid): {
                     "slot_inbound_units": round(inbound_units_by_factory.get(fid, 0.0), 4),
-                    "required_extra_pwm": round(required_extra_pwm_by_factory.get(fid, 0.0), 4),
+                    "slot_shipment_units": round(shipment_units_by_factory.get(fid, 0.0), 4),
+                    "door_open_count": int(door_open_count_by_factory.get(fid, 0)),
+                    "required_extra_cooling_c": round(required_extra_cooling_c_by_factory.get(fid, 0.0), 4),
                 }
                 for fid in sorted(inbound_units_by_factory.keys())
             },
@@ -479,31 +680,66 @@ def run_optimization(
     variable_values: dict[str, dict[str, float]] = {}
     total_cost_term = 0.0
     total_solar_credit_term = 0.0
-    total_thermal_penalty_term = 0.0
-    total_inbound_penalty_term = 0.0
+    total_ambient_penalty_term = 0.0
     total_temp_tracking_penalty_term = 0.0
+    total_low_temp_extra_term = 0.0
+    total_inbound_cooling_penalty_term = 0.0
+    total_economic_tracking_penalty_term = 0.0
+    mode_temp_drop_threshold_c = float(env_weights.get("mode_temp_drop_threshold_c", 1.5))
     for factory in sensor_states:
         factory_id = int(factory["factory_id"])
-        on_val = float(pulp.value(on[factory_id]) or 0.0)
-        pwm_val = float(pulp.value(pwm[factory_id]) or 0.0)
+        recommended_temp_val = float(
+            pulp.value(recommended_temp[factory_id]) or target_temp_by_factory[factory_id]
+        )
+        estimated_grid_kwh_val = _estimated_grid_kwh_from_temp(
+            target_temp_c=target_temp_by_factory[factory_id],
+            recommended_temp_c=recommended_temp_val,
+            min_precool_temp_c=min_precool_temp_by_factory[factory_id],
+            ambient_risk=ambient_risk,
+            inbound_units=inbound_units_by_factory.get(factory_id, 0.0),
+            env_weights=env_weights,
+        )
+        temp_drop_val = max(0.0, target_temp_by_factory[factory_id] - recommended_temp_val)
+        deep_threshold_c = (
+            max(0.1, target_temp_by_factory[factory_id] - min_precool_temp_by_factory[factory_id])
+            * deep_cooling_threshold_ratio
+        )
+        deep_extra_drop_val = max(0.0, temp_drop_val - deep_threshold_c)
         variable_values[str(factory_id)] = {
-            "on": round(on_val, 4),
-            "pwm": round(pwm_val, 4),
+            "recommended_temp_c": round(recommended_temp_val, 4),
+            "estimated_grid_kwh": round(estimated_grid_kwh_val, 4),
+            "deep_cooling_extra_drop_c": round(deep_extra_drop_val, 4),
+            "inbound_shortfall_c": round(
+                max(0.0, recommended_temp_val - inbound_required_cap_temp_by_factory[factory_id]), 4
+            ),
         }
-        total_cost_term += pwm_val * slot_kwh_per_pwm * tou_price
-        total_solar_credit_term += pwm_val * slot_kwh_per_pwm * (solar_kwh * w_solar * 0.1)
-        total_thermal_penalty_term += (100 - pwm_val) * max(0.0, w_temp - 1.0) * 0.02
-        total_inbound_penalty_term += (100 - pwm_val) * inbound_penalty_weight * 0.01
-        desired_pwm = desired_pwm_by_factory.get(factory_id, 20.0)
-        total_temp_tracking_penalty_term += abs(pwm_val - desired_pwm) * temp_tracking_penalty_weight
-        if pwm_val < 35:
-            mode = "COASTING"
-            grid_kwh = pwm_val * slot_kwh_per_pwm
-            reason = "PEAK_AVOID"
+        total_cost_term += estimated_grid_kwh_val * tou_price
+        total_solar_credit_term += estimated_grid_kwh_val * tou_price * (solar_util_ratio * w_solar)
+        total_ambient_penalty_term += (
+            (recommended_temp_val - min_precool_temp_by_factory[factory_id])
+            * ambient_risk
+            * ambient_temp_penalty_weight
+        )
+        desired_temp = desired_temp_by_factory.get(factory_id, target_temp_by_factory[factory_id])
+        total_temp_tracking_penalty_term += abs(recommended_temp_val - desired_temp) * temp_tracking_penalty_weight
+        total_low_temp_extra_term += deep_extra_drop_val * low_temp_extra_kwh_per_c
+        total_inbound_cooling_penalty_term += (
+            max(0.0, recommended_temp_val - inbound_required_cap_temp_by_factory[factory_id])
+            * inbound_cooling_penalty_weight
+        )
+        total_economic_tracking_penalty_term += (
+            abs(recommended_temp_val - economic_target_temp_by_factory[factory_id])
+            * economic_tracking_penalty_weight
+        )
+        if str(factory.get("status", "")) == "WARNING":
+            mode = "RECOVERY"
+            reason = "TEMP_RECOVERY"
+        elif temp_drop_val >= mode_temp_drop_threshold_c:
+            mode = "PRECOOL"
+            reason = "BASE_LOAD"
         else:
-            mode = "ON"
-            grid_kwh = pwm_val * slot_kwh_per_pwm
-            reason = "TEMP_RECOVERY" if str(factory.get("status", "")) == "WARNING" else "BASE_LOAD"
+            mode = "HOLD"
+            reason = "PEAK_AVOID" if tou_price >= 180 else "BASE_LOAD"
 
         blocks.append(
             {
@@ -511,12 +747,11 @@ def run_optimization(
                 "start_at": now.isoformat(),
                 "end_at": horizon_end.isoformat(),
                 "mode": mode,
-                "target_temp_c": float(factory.get("target_temp_c", -18.0)),
-                "expected_grid_kwh": round(max(0.0, grid_kwh), 3),
+                "target_temp_c": round(target_temp_by_factory[factory_id], 2),
+                "recommended_temp_c": round(recommended_temp_val, 2),
+                "expected_grid_kwh": round(max(0.0, estimated_grid_kwh_val), 3),
                 "expected_solar_kwh": round(max(0.0, solar_kwh * w_solar), 3),
                 "reason": reason,
-                "pwm_pct": round(max(0.0, min(100.0, pwm_val)), 1),
-                "on_value": round(on_val, 3),
             }
         )
 
@@ -528,37 +763,53 @@ def run_optimization(
         "objective_breakdown": {
             "cost_term": round(total_cost_term, 6),
             "solar_credit_term": round(total_solar_credit_term, 6),
-            "thermal_penalty_term": round(total_thermal_penalty_term, 6),
-            "inbound_penalty_term": round(total_inbound_penalty_term, 6),
+            "ambient_penalty_term": round(total_ambient_penalty_term, 6),
             "temp_tracking_penalty_term": round(total_temp_tracking_penalty_term, 6),
+            "low_temp_extra_term": round(total_low_temp_extra_term, 6),
+            "inbound_cooling_penalty_term": round(total_inbound_cooling_penalty_term, 6),
+            "economic_tracking_penalty_term": round(total_economic_tracking_penalty_term, 6),
             "objective_value": round(
                 total_cost_term
                 - total_solar_credit_term
-                + total_thermal_penalty_term
-                + total_inbound_penalty_term,
+                + total_ambient_penalty_term,
                 # 온도 추종 연속 패널티를 포함한 최종 목적함수 값
                 6,
             ),
             "objective_value_with_temp_tracking": round(
                 total_cost_term
                 - total_solar_credit_term
-                + total_thermal_penalty_term
-                + total_inbound_penalty_term
+                + total_ambient_penalty_term
                 + total_temp_tracking_penalty_term,
+                # 입고냉각/경제신호 추종 패널티까지 포함한 최종 목적함수 값
+                6,
+            ),
+            "objective_value_full": round(
+                total_cost_term
+                - total_solar_credit_term
+                + total_ambient_penalty_term
+                + total_temp_tracking_penalty_term
+                + total_inbound_cooling_penalty_term
+                + total_economic_tracking_penalty_term,
                 6,
             ),
         },
         "temperature_tracking": {
             str(fid): {
-                "desired_pwm": round(desired_pwm_by_factory.get(fid, 20.0), 3),
+                "desired_temp_c": round(desired_temp_by_factory.get(fid, target_temp_by_factory[fid]), 3),
+                "economic_target_temp_c": round(
+                    economic_target_temp_by_factory.get(fid, target_temp_by_factory[fid]),
+                    3,
+                ),
                 "temp_gap_c": round(temp_gap_by_factory.get(fid, 0.0), 3),
             }
-            for fid in sorted(desired_pwm_by_factory.keys())
+            for fid in sorted(desired_temp_by_factory.keys())
         },
         "inbound_allocation": {
             str(fid): {
                 "slot_inbound_units": round(inbound_units_by_factory.get(fid, 0.0), 4),
-                "required_extra_pwm": round(required_extra_pwm_by_factory.get(fid, 0.0), 4),
+                "slot_shipment_units": round(shipment_units_by_factory.get(fid, 0.0), 4),
+                "door_open_count": int(door_open_count_by_factory.get(fid, 0)),
+                "required_extra_cooling_c": round(required_extra_cooling_c_by_factory.get(fid, 0.0), 4),
             }
             for fid in sorted(inbound_units_by_factory.keys())
         },
@@ -570,15 +821,28 @@ def run_optimization(
             "outdoor_temp_c": outdoor_temp_c,
             "outdoor_temp_rows": len(forecast_rows),
             "solar_kwh": solar_kwh,
-            "slot_kwh_per_pwm": slot_kwh_per_pwm,
-            "min_active": min_active,
+            "solar_util_ratio": round(solar_util_ratio, 4),
+            "solar_util_reference_kwh": round(solar_util_reference_kwh, 4),
             "thermal_planning_hours": round(thermal_planning_hours, 3),
             "effective_planning_hours": round(effective_planning_hours, 3),
             "remaining_time_hours": round(remaining_time_hours, 3),
             "inbound_units_this_slot": round(inbound_units_this_slot, 3),
-            "required_pwm_total": round(required_pwm_total, 3),
             "temp_tracking_penalty_weight": round(temp_tracking_penalty_weight, 4),
-            "inbound_pwm_per_unit": round(inbound_pwm_per_unit, 4),
+            "inbound_cooling_penalty_weight": round(inbound_cooling_penalty_weight, 4),
+            "economic_tracking_penalty_weight": round(economic_tracking_penalty_weight, 4),
+            "economic_signal": round(economic_signal, 4),
+            "economic_precool_max_c": round(economic_precool_max_c, 4),
+            "inbound_cooling_c_per_unit": round(inbound_cooling_c_per_unit, 4),
+            "shipment_cooling_relief_c_per_unit": round(shipment_cooling_relief_c_per_unit, 4),
+            "door_open_loss_c_per_event": round(door_open_loss_c_per_event, 4),
+            "cooling_strength_per_c": round(cooling_strength_per_c, 4),
+            "base_maintenance_kwh_per_slot": round(base_maintenance_kwh, 4),
+            "inbound_kwh_per_unit": round(inbound_kwh_per_unit, 4),
+            "stability_kwh_per_ratio": round(stability_kwh_per_ratio, 4),
+            "daily_shipment_hour": daily_shipment_hour,
+            "daily_shipment_max_ratio": round(daily_shipment_max_ratio, 4),
+            "deep_cooling_threshold_ratio": round(deep_cooling_threshold_ratio, 4),
+            "low_temp_extra_kwh_per_c": round(low_temp_extra_kwh_per_c, 4),
             "inbound_allocation_source": inbound_allocation_source,
         },
     }
