@@ -80,6 +80,12 @@ except Exception:  # pragma: no cover - optional integration fallback
     weather_service = None  # type: ignore
 
 try:
+    from backend.services import anomaly_service
+except Exception:
+    anomaly_service = None # type: ignore
+
+
+try:
     _aps_module = importlib.import_module("apscheduler.schedulers.background")
     BackgroundScheduler = _aps_module.BackgroundScheduler
 except Exception:  # pragma: no cover - optional dependency fallback
@@ -637,8 +643,14 @@ def run_job_b_update_environment_weights() -> dict[str, Any]:
 
 
 def run_job_c_monitor_alerts() -> dict[str, Any]:
-    """Job C 스텁: 온도 이탈·알림 감시 작업 자리(현재는 미구현)."""
-    return {"success": True, "skipped": True, "reason": "NOT_IMPLEMENTED"}
+    """Job C: 1분 주기 이상 감지 및 알림 감시 작업."""
+    if anomaly_service is None:
+        return{
+            "success": False,
+            "skipped": True,
+            "reason": "ANOMALY_SERVICE_NOT_AVAILABLE"
+        }
+    return anomaly_service.run_anomaly_monitoring()
 
 
 def get_scheduler() -> Any:
@@ -653,13 +665,21 @@ def get_scheduler() -> Any:
 
 
 def configure_scheduler_jobs() -> Any:
-    """현재 단계에서는 Job A(30분 주기)만 스케줄러에 등록한다."""
+    """현재 단계에서는 Job A(30분 주기)와 Job C(1분 주기 이상 감지)만 스케줄러에 등록한다."""
     scheduler = get_scheduler()
     scheduler.add_job(
         run_job_a_optimization,
         trigger="cron",
         minute="*/30",
         id="job_a_optimization",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        run_job_c_monitor_alerts,
+        trigger="cron",
+        minute="*/1",
+        id="job_c_monitor_alerts",
         replace_existing=True,
     )
     return scheduler

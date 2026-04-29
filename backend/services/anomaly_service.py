@@ -73,39 +73,49 @@ def check_temperature_spike(current_sensor_log, old_sensor_log):
         )
     return None
 
-# 임시 테스트용
-if __name__ == "__main__":
-    print("=== 온도 범위 테스트 ===")
-    dummy_sensor_logs = [
+def run_anomaly_monitoring() -> dict:
+    '''
+    Job C에서 1분마다 호출할 이상 감지 총괄 함수
+    현재는 더미 데이터로 감지 로직만 실행 
+    '''
+
+    latest_sensor_logs = [
         {"factory_id": 1, "temperature_c": -21.40},
         {"factory_id": 3, "temperature_c": -16.20},
         {"factory_id": 4, "temperature_c": -14.50},
     ]
 
-    for sensor_log in dummy_sensor_logs:
-        result = check_temperature_range(sensor_log)
-
-        if result:
-            print("이상 감지됨:", result)
-        else:
-            print("정상:", sensor_log)
-    
-    print("\n=== 온도 급변 테스트 ===")
-    current_sensor_log = {
-        "factory_id": 1,
-        "temperature_c": -14.5,
-        "measured_at": "2026-04-29T13:00:00",
+    old_sensor_logs_by_factory = {
+        1: {"factory_id": 1, "temperature_c": -20.0},
+        3: {"factory_id": 3, "temperature_c": -17.0},
+        4: {"factory_id": 4, "temperature_c": -20.0},
     }
 
-    old_sensor_log = {
-        "factory_id": 1,
-        "temperature_c": -20.0,
-        "measured_at": "2026-04-29T12:56:00",
+    detected_alerts = []
+
+    for sensor_log in latest_sensor_logs:
+        factory_id = sensor_log["factory_id"]
+
+        range_result = check_temperature_range(sensor_log)
+        if range_result:
+            detected_alerts.append(range_result)
+
+        old_sensor_log = old_sensor_logs_by_factory.get(factory_id)
+
+        spike_result = check_temperature_spike(sensor_log, old_sensor_log)
+        if spike_result:
+            detected_alerts.append(spike_result)
+
+    return {
+        "success": True,
+        "checked_count": len(latest_sensor_logs),
+        "alerts_created": len(detected_alerts),
+        "alerts": detected_alerts,
+        "message": "anomaly monitoring executed",
     }
 
-    result = check_temperature_spike(current_sensor_log, old_sensor_log)
+# 임시 테스트용
+if __name__ == "__main__":
 
-    if result:
-        print("급변 감지됨:", result)
-    else:
-        print("급변 없음")
+    print("\n=== Job C 총괄 함수 테스트 ===")
+    print(run_anomaly_monitoring())
